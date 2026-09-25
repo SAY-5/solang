@@ -8,6 +8,7 @@ use super::{
     vartable::{Vars, Vartable},
     vector_to_slice, Options,
 };
+use crate::codegen::interface::TargetCodegen;
 use crate::codegen::subexpression_elimination::common_sub_expression_elimination;
 use crate::codegen::{undefined_variable, Expression, LLVMName};
 use crate::sema::ast::{
@@ -1483,19 +1484,20 @@ fn is_there_virtual_function(
 
 /// Generate the CFG for a function. If function_no is None, generate the implicit default
 /// constructor
-pub fn generate_cfg(
+pub(crate) fn generate_cfg(
     contract_no: usize,
     function_no: Option<usize>,
     cfg_no: usize,
     all_cfgs: &mut Vec<ControlFlowGraph>,
     ns: &mut Namespace,
     opt: &Options,
+    target: &dyn TargetCodegen,
 ) {
     if is_there_virtual_function(ns, contract_no, function_no) {
         return;
     }
 
-    let mut cfg = function_cfg(contract_no, function_no, ns, opt);
+    let mut cfg = function_cfg(contract_no, function_no, ns, opt, target);
     let ast_fn = function_no
         .map(ASTFunction::SolidityFunction)
         .unwrap_or(ASTFunction::None);
@@ -1524,6 +1526,7 @@ pub fn generate_cfg(
                     chain_no,
                     ns,
                     opt,
+                    target,
                 );
                 optimize_and_check_cfg(&mut cfg, ns, ast_fn, opt);
             }
@@ -1609,6 +1612,7 @@ fn function_cfg(
     function_no: Option<usize>,
     ns: &mut Namespace,
     opt: &Options,
+    target: &dyn TargetCodegen,
 ) -> ControlFlowGraph {
     let mut vartab = match function_no {
         Some(function_no) => {
@@ -1667,7 +1671,7 @@ fn function_cfg(
     cfg.nonpayable = !func.is_payable();
 
     // populate the argument variables
-    populate_arguments(func, &mut cfg, &mut vartab, ns);
+    populate_arguments(func, &mut cfg, &mut vartab);
 
     // Hold your breath, this is the trickest part of the codegen ahead.
     // For each contract, the top-level constructor calls the base constructors. The base
@@ -1727,8 +1731,16 @@ fn function_cfg(
                     .iter()
                     .enumerate()
                     .map(|(i, a)| {
-                        let expr =
-                            expression(a, &mut cfg, contract_no, Some(func), ns, &mut vartab, opt);
+                        let expr = expression(
+                            a,
+                            &mut cfg,
+                            contract_no,
+                            Some(func),
+                            ns,
+                            &mut vartab,
+                            opt,
+                            target,
+                        );
 
                         if let Some(id) = &func.symtable.arguments[i] {
                             let ty = expr.ty();
@@ -1806,6 +1818,7 @@ fn function_cfg(
             None,
             None,
             opt,
+            target,
         );
 
         if !stmt.reachable() {
@@ -1847,19 +1860,10 @@ pub(crate) fn populate_arguments<T: FunctionAttributes>(
     func: &T,
     cfg: &mut ControlFlowGraph,
     vartab: &mut Vartable,
-    ns: &Namespace,
 ) {
     for (i, arg) in func.get_symbol_table().arguments.iter().enumerate() {
         if let Some(pos) = arg {
             let var = &func.get_symbol_table().vars[pos];
-            let mut runtime_ty = var.ty.clone();
-
-            if ns.target == Target::Soroban && cfg.public {
-                runtime_ty = soroban_runtime_arg_ty(&runtime_ty);
-                if let Some(slot) = vartab.vars.get_mut(pos) {
-                    slot.ty = runtime_ty.clone();
-                }
-            }
 
             cfg.add(
                 vartab,
@@ -1868,24 +1872,12 @@ pub(crate) fn populate_arguments<T: FunctionAttributes>(
                     res: *pos,
                     expr: Expression::FunctionArg {
                         loc: var.id.loc,
-                        ty: runtime_ty,
+                        ty: var.ty.clone(),
                         arg_no: i,
                     },
                 },
             );
         }
-    }
-}
-
-fn soroban_runtime_arg_ty(ty: &Type) -> Type {
-    match ty {
-        Type::Array(elem_ty, dims) if dims.last() == Some(&ast::ArrayLength::Dynamic) => {
-            Type::Array(
-                Box::new(Type::SorobanHandle(Box::new(elem_ty.as_ref().clone()))),
-                dims.clone(),
-            )
-        }
-        _ => ty.clone(),
     }
 }
 
@@ -1920,6 +1912,7 @@ fn generate_modifier_dispatch(
     chain_no: usize,
     ns: &mut Namespace,
     opt: &Options,
+    target: &dyn TargetCodegen,
 ) -> ControlFlowGraph {
     let (modifier_no, args) = resolve_modifier_call(
         &ns.functions[func_no].modifiers[chain_no],
@@ -1976,6 +1969,7 @@ fn generate_modifier_dispatch(
                 ns,
                 &mut vartab,
                 opt,
+                target,
             );
             cfg.add(
                 &mut vartab,
@@ -2033,6 +2027,7 @@ fn generate_modifier_dispatch(
             Some(&placeholder),
             Some(&return_instr),
             opt,
+            target,
         );
     }
 

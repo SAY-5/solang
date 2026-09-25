@@ -2,7 +2,6 @@
 
 use crate::codegen::cfg::HashTy;
 use crate::codegen::error::CodegenError;
-use crate::codegen::Builtin;
 use crate::codegen::Expression;
 use crate::emit::binary::Binary;
 use crate::emit::soroban::{HostFunctions, SorobanTarget};
@@ -21,8 +20,6 @@ use inkwell::values::{
 
 use solang_parser::helpers::CodeLocation;
 use solang_parser::pt::{Loc, StorageType};
-
-use num_traits::ToPrimitive;
 
 use std::collections::HashMap;
 
@@ -84,13 +81,8 @@ impl<'a> TargetRuntime<'a> for SorobanTarget {
         function: FunctionValue<'a>,
         storage_type: &Option<StorageType>,
     ) -> BasicValueEnum<'a> {
-        if let Some(Type::StorageRef(_, inner)) = slot_ty {
-            if let Type::Array(inner_ty, _) = inner.as_ref() {
-                if !is_reference_type(inner_ty) {
-                    return get_storage_vec_subscript(bin, function, *slot);
-                }
-            }
-        }
+        // Scalar-element storage-array subscript reads are handled in codegen now
+        // (arrays.rs, vec_get); this path only serves other storage loads.
         let storage_type = storage_type_to_int(storage_type);
         emit_context!(bin);
 
@@ -101,18 +93,6 @@ impl<'a> TargetRuntime<'a> for SorobanTarget {
         } else {
             *slot
         };
-
-        // If we are loading a struct, we need to load each field separately and put it in a buffer of this format: [ field1, field2, ... ] where each field is a Soroban tagged value of type i64
-        // We loop over each field, call GetContractData for each field and put it in the buffer
-        if let Type::Struct(ast::StructType::UserDefined(n)) = ty {
-            let field_count = &bin.ns.structs[*n].fields.len();
-
-            // call soroban_get_fields to get a buffer with all fields
-            let struct_buffer =
-                soroban_get_fields_to_val_buffer(bin, function, slot, *field_count, storage_type);
-
-            return struct_buffer.as_basic_value_enum();
-        }
 
         // === Call HasContractData ===
         let has_data_val = call!(
@@ -184,14 +164,8 @@ impl<'a> TargetRuntime<'a> for SorobanTarget {
         function: FunctionValue<'a>,
         storage_type: &Option<StorageType>,
     ) {
-        if let Some(Type::StorageRef(_, inner)) = slot_ty {
-            if let Type::Array(inner_ty, _) = inner.as_ref() {
-                if !is_reference_type(inner_ty) {
-                    return set_storage_vec_subscript(bin, function, *slot, dest.into_int_value());
-                }
-            }
-        }
-
+        // Scalar-element storage-array subscript writes are handled in codegen now
+        // (arrays.rs, vec_put); this path only serves other storage stores.
         emit_context!(bin);
 
         let storage_type = storage_type_to_int(storage_type);
@@ -207,33 +181,6 @@ impl<'a> TargetRuntime<'a> for SorobanTarget {
         } else {
             *slot
         };
-
-        // In case of struct, we receive a buffer in that format: [ field1, field2, ... ] where each field is a Soroban tagged value of type i64
-        // therefore, for each field, we need to extract it from the buffer and call PutContractData for each field separately
-
-        // This check is added to handle the case we are stroing a struct in storage
-        let inner_ty = if let Type::StorageRef(mutable, inner) = ty {
-            inner
-        } else {
-            ty
-        };
-
-        if let Type::Struct(ast::StructType::UserDefined(n)) = inner_ty {
-            let field_count = &bin.ns.structs[*n].fields.len();
-
-            let data_ptr = bin.vector_bytes(dest);
-
-            // call soroban_put_fields for each field
-            soroban_put_fields_from_val_buffer(
-                bin,
-                function,
-                slot,
-                data_ptr,
-                *field_count,
-                storage_type,
-            );
-            return;
-        }
 
         let value = bin
             .builder
@@ -326,9 +273,42 @@ impl<'a> TargetRuntime<'a> for SorobanTarget {
         function: FunctionValue,
         slot: IntValue<'a>,
         index: IntValue<'a>,
-        loc: Loc,
+        _loc: Loc,
     ) -> IntValue<'a> {
-        unsupported_soroban(loc, "storage bytes subscript loads")
+        emit_context!(bin);
+
+        // Load BytesObject handle from persistent storage.
+        let bytes_obj = call!(
+            HostFunctions::GetContractData.name(),
+            &[slot.into(), i64_const!(1).into()],
+            "bytes_load"
+        )
+        .try_as_basic_value()
+        .left()
+        .unwrap()
+        .into_int_value();
+
+        let idx_encoded = encode_value(index, 32, 4, bin);
+
+        // bytes_get(handle, U32Val(i)) → U32Val(byte)
+        let raw = call!(
+            HostFunctions::BytesGet.name(),
+            &[bytes_obj.into(), idx_encoded.into()],
+            "bytes_get"
+        )
+        .try_as_basic_value()
+        .left()
+        .unwrap()
+        .into_int_value();
+
+        // Decode U32Val: shift right 32 and truncate to i8 (bytes1).
+        let shifted = bin
+            .builder
+            .build_right_shift(raw, i64_const!(32), false, "byte_raw")
+            .unwrap();
+        bin.builder
+            .build_int_truncate(shifted, bin.context.i8_type(), "byte_val")
+            .unwrap()
     }
 
     fn set_storage_bytes_subscript(
@@ -338,122 +318,64 @@ impl<'a> TargetRuntime<'a> for SorobanTarget {
         slot: IntValue<'a>,
         index: IntValue<'a>,
         value: IntValue<'a>,
-        loc: Loc,
+        _loc: Loc,
     ) {
-        unsupported_soroban(loc, "storage bytes subscript stores")
+        emit_context!(bin);
+
+        // Load existing BytesObject handle from persistent storage.
+        let bytes_obj = call!(
+            HostFunctions::GetContractData.name(),
+            &[slot.into(), i64_const!(1).into()],
+            "bytes_load"
+        )
+        .try_as_basic_value()
+        .left()
+        .unwrap()
+        .into_int_value();
+
+        let idx_encoded = encode_value(index, 32, 4, bin);
+
+        // bytes1 value is i8; zero-extend to i32 for U32Val encoding.
+        let value = if value.get_type().get_bit_width() != 32 {
+            bin.builder
+                .build_int_z_extend(value, bin.context.i32_type(), "byte32")
+                .unwrap()
+        } else {
+            value
+        };
+        let val_encoded = encode_value(value, 32, 4, bin);
+
+        // bytes_put(handle, U32Val(i), U32Val(byte)) → new BytesObject
+        let new_obj = call!(
+            HostFunctions::BytesPut.name(),
+            &[bytes_obj.into(), idx_encoded.into(), val_encoded.into()],
+            "bytes_put"
+        )
+        .try_as_basic_value()
+        .left()
+        .unwrap()
+        .into_int_value();
+
+        // Write the new handle back to persistent storage.
+        call!(
+            HostFunctions::PutContractData.name(),
+            &[slot.into(), new_obj.into(), i64_const!(1).into()],
+            "bytes_store"
+        );
     }
 
     fn storage_subscript(
         &self,
-        bin: &Binary<'a>,
-        function: FunctionValue<'a>,
-        ty: &Type,
-        slot: IntValue<'a>,
-        index: BasicValueEnum<'a>,
+        _bin: &Binary<'a>,
+        _function: FunctionValue<'a>,
+        _ty: &Type,
+        _slot: IntValue<'a>,
+        _index: BasicValueEnum<'a>,
     ) -> IntValue<'a> {
-        if let Type::StorageRef(_, ty) = ty {
-            if let Type::Array(inner, _) = *ty.clone() {
-                if !is_reference_type(&inner) {
-                    // here, we return a memory array with the following format: [ slot, index ]
-
-                    let arr = bin
-                        .builder
-                        .build_array_alloca(
-                            bin.context.i64_type(),
-                            bin.context.i64_type().const_int(2, false),
-                            "array_subscript",
-                        )
-                        .unwrap();
-
-                    bin.builder.build_store(arr, slot).unwrap();
-
-                    // advance pointer to index
-
-                    let index_ptr = unsafe {
-                        bin.builder
-                            .build_gep(
-                                bin.context.i64_type().array_type(1),
-                                arr,
-                                &[
-                                    bin.context.i64_type().const_zero(),
-                                    bin.context.i64_type().const_int(1, false),
-                                ],
-                                "index_ptr",
-                            )
-                            .unwrap()
-                    };
-
-                    bin.builder.build_store(index_ptr, index).unwrap();
-
-                    // now return the pointer as int value
-                    let arr_ptr_as_int = bin
-                        .builder
-                        .build_ptr_to_int(arr, bin.context.i64_type(), "array_ptr_as_int")
-                        .unwrap();
-                    return arr_ptr_as_int;
-                }
-            }
-        }
-
-        let vec_new = bin
-            .builder
-            .build_call(
-                bin.module
-                    .get_function(HostFunctions::VectorNew.name())
-                    .unwrap(),
-                &[],
-                "vec_new",
-            )
-            .unwrap()
-            .try_as_basic_value()
-            .left()
-            .unwrap()
-            .into_int_value();
-
-        // push the slot to the vector as U32Val
-        let slot_encoded = encode_value(
-            if slot.get_type().get_bit_width() == 64 {
-                slot
-            } else {
-                bin.builder
-                    .build_int_z_extend(slot, bin.context.i64_type(), "slot64")
-                    .unwrap()
-            },
-            32,
-            4,
-            bin,
-        );
-        let res = bin
-            .builder
-            .build_call(
-                bin.module
-                    .get_function(HostFunctions::VecPushBack.name())
-                    .unwrap(),
-                &[vec_new.as_basic_value_enum().into(), slot_encoded.into()],
-                "push",
-            )
-            .unwrap()
-            .try_as_basic_value()
-            .left()
-            .unwrap()
-            .into_int_value();
-
-        // push the index to the vector
-        let res = bin
-            .builder
-            .build_call(
-                bin.module
-                    .get_function(HostFunctions::VecPushBack.name())
-                    .unwrap(),
-                &[res.as_basic_value_enum().into(), index.into()],
-                "push",
-            )
-            .unwrap()
-            .try_as_basic_value()
-            .left()
-            .unwrap()
-            .into_int_value();
-        res
+        // All storage subscripts (arrays and mappings) are lowered in codegen now
+        // (storage_path.rs: vec_get/vec_put for arrays, map_get/map_put for
+        // mappings), so no `Subscript` storage expression reaches emit.
+        unsupported_soroban(Loc::Codegen, "storage subscript")
     }
 
     fn storage_push(
@@ -481,83 +403,13 @@ impl<'a> TargetRuntime<'a> for SorobanTarget {
 
     fn storage_array_length(
         &self,
-        bin: &Binary<'a>,
+        _bin: &Binary<'a>,
         _function: FunctionValue,
-        slot: IntValue<'a>,
-        elem_ty: &Type,
+        _slot: IntValue<'a>,
+        _elem_ty: &Type,
     ) -> IntValue<'a> {
-        if !is_reference_type(elem_ty) {
-            // Native arrays use VecObject layout: load vec object then call VecLen.
-            let load_storage = bin
-                .builder
-                .build_call(
-                    bin.module
-                        .get_function(HostFunctions::GetContractData.name())
-                        .unwrap(),
-                    &[
-                        slot.into(),
-                        bin.context.i64_type().const_int(1, false).into(), // persistent storage
-                    ],
-                    "load_storage",
-                )
-                .unwrap()
-                .try_as_basic_value()
-                .left()
-                .unwrap()
-                .into_int_value();
-
-            let u32_val = bin
-                .builder
-                .build_call(
-                    bin.module
-                        .get_function(HostFunctions::VecLen.name())
-                        .unwrap(),
-                    &[load_storage.into()],
-                    "vec_len",
-                )
-                .unwrap()
-                .try_as_basic_value()
-                .left()
-                .unwrap()
-                .into_int_value();
-
-            // VecLen returns U32Val => payload in top 32 bits.
-            return bin
-                .builder
-                .build_right_shift(
-                    u32_val,
-                    bin.context.i64_type().const_int(32, false),
-                    false,
-                    "length",
-                )
-                .unwrap();
-        }
-        // Reference arrays keep old layout: length encoded in slot as U64Small.
-        let storage_ty = bin.context.i64_type().const_int(1, false);
-        let loaded_len = bin
-            .builder
-            .build_call(
-                bin.module
-                    .get_function(HostFunctions::GetContractData.name())
-                    .unwrap(),
-                &[slot.into(), storage_ty.into()],
-                "get_len",
-            )
-            .unwrap()
-            .try_as_basic_value()
-            .left()
-            .unwrap()
-            .into_int_value();
-
-        // U64Small payload is shifted by 8 bits.
-        bin.builder
-            .build_right_shift(
-                loaded_len,
-                bin.context.i64_type().const_int(8, false),
-                false,
-                "length",
-            )
-            .unwrap()
+        // Every storage array length is computed in codegen now (arrays.rs, vec_len).
+        unsupported_soroban(Loc::Codegen, "storage array length")
     }
 
     /// keccak256 hash
@@ -756,14 +608,18 @@ impl<'a> TargetRuntime<'a> for SorobanTarget {
             .unwrap_or_else(|| expect_return_value(None, "emitting Soroban external call"))
             .into_int_value();
 
-        let allocate_i64 = bin
-            .builder
-            .build_alloca(bin.context.i64_type(), "allocate_i64")
-            .unwrap();
+        let ret_vector = bin.vector_new(
+            bin.context.i32_type().const_int(8, false),
+            bin.context.i32_type().const_int(1, false),
+            None,
+        );
+        let ret_data = bin.vector_bytes(ret_vector);
+        bin.builder.build_store(ret_data, call_res).unwrap();
+        *bin.return_data.borrow_mut() = Some(ret_vector.into_pointer_value());
 
-        bin.builder.build_store(allocate_i64, call_res).unwrap();
-
-        *bin.return_data.borrow_mut() = Some(allocate_i64);
+        if let Some(success) = success {
+            *success = bin.context.i32_type().const_int(1, false).into();
+        }
     }
 
     /// send value to address
@@ -782,289 +638,12 @@ impl<'a> TargetRuntime<'a> for SorobanTarget {
     /// builtin expressions
     fn builtin<'b>(
         &self,
-        bin: &Binary<'b>,
+        _bin: &Binary<'b>,
         expr: &Expression,
-        vartab: &HashMap<usize, Variable<'b>>,
-        function: FunctionValue<'b>,
+        _vartab: &HashMap<usize, Variable<'b>>,
+        _function: FunctionValue<'b>,
     ) -> BasicValueEnum<'b> {
-        emit_context!(bin);
-
-        match expr {
-            Expression::Builtin {
-                kind: Builtin::Timestamp,
-                args,
-                ..
-            } => {
-                assert_eq!(args.len(), 0, "timestamp expects no arguments");
-
-                let function_name = HostFunctions::GetLedgerTimestamp.name();
-                let function_value =
-                    runtime_helper(bin, function_name, "reading Soroban ledger timestamp");
-                let timestamp_val = bin
-                    .builder
-                    .build_call(function_value, &[], function_name)
-                    .unwrap()
-                    .try_as_basic_value()
-                    .left()
-                    .unwrap_or_else(|| {
-                        expect_return_value(None, "reading Soroban ledger timestamp")
-                    })
-                    .into_int_value();
-
-                // Decode U64Val: U64Small values are immediate, otherwise decode U64Object via ObjToU64.
-                let tag = bin
-                    .builder
-                    .build_and(
-                        timestamp_val,
-                        bin.context.i64_type().const_int(0xff, false),
-                        "timestamp_tag",
-                    )
-                    .unwrap();
-                let is_u64_small = bin
-                    .builder
-                    .build_int_compare(
-                        inkwell::IntPredicate::EQ,
-                        tag,
-                        bin.context.i64_type().const_int(6, false), // Tag::U64Small
-                        "is_u64_small",
-                    )
-                    .unwrap();
-
-                let value_is_small = bin
-                    .context
-                    .append_basic_block(function, "timestamp_value_is_small");
-                let value_is_object = bin
-                    .context
-                    .append_basic_block(function, "timestamp_value_is_object");
-                let value_decoded = bin
-                    .context
-                    .append_basic_block(function, "timestamp_value_decoded");
-
-                bin.builder
-                    .build_conditional_branch(is_u64_small, value_is_small, value_is_object)
-                    .unwrap();
-
-                bin.builder.position_at_end(value_is_small);
-
-                let small_value = bin
-                    .builder
-                    .build_right_shift(
-                        timestamp_val,
-                        bin.context.i64_type().const_int(8, false),
-                        false,
-                        "timestamp_small_value",
-                    )
-                    .unwrap();
-
-                bin.builder
-                    .build_unconditional_branch(value_decoded)
-                    .unwrap();
-
-                let small_value_block = expect_llvm_entity(
-                    bin.builder.get_insert_block(),
-                    "decoding Soroban ledger timestamp",
-                    "small timestamp block",
-                );
-
-                bin.builder.position_at_end(value_is_object);
-
-                let decode_function_name = HostFunctions::ObjToU64.name();
-                let decode_function_value = runtime_helper(
-                    bin,
-                    decode_function_name,
-                    "decoding Soroban ledger timestamp object",
-                );
-                let object_value = bin
-                    .builder
-                    .build_call(
-                        decode_function_value,
-                        &[timestamp_val.into()],
-                        decode_function_name,
-                    )
-                    .unwrap()
-                    .try_as_basic_value()
-                    .left()
-                    .unwrap_or_else(|| {
-                        expect_return_value(None, "decoding Soroban ledger timestamp object")
-                    })
-                    .into_int_value();
-
-                bin.builder
-                    .build_unconditional_branch(value_decoded)
-                    .unwrap();
-
-                let object_value_block = expect_llvm_entity(
-                    bin.builder.get_insert_block(),
-                    "decoding Soroban ledger timestamp",
-                    "object timestamp block",
-                );
-
-                bin.builder.position_at_end(value_decoded);
-
-                let timestamp = bin
-                    .builder
-                    .build_phi(bin.context.i64_type(), "timestamp")
-                    .unwrap();
-                timestamp.add_incoming(&[
-                    (&small_value, small_value_block),
-                    (&object_value, object_value_block),
-                ]);
-
-                timestamp.as_basic_value()
-            }
-            Expression::Builtin {
-                kind: Builtin::ExtendTtl,
-                args,
-                ..
-            } => {
-                // Get arguments
-                // (func $extend_contract_data_ttl (param $k_val i64) (param $t_storage_type i64) (param $threshold_u32_val i64) (param $extend_to_u32_val i64) (result i64))
-                assert_eq!(args.len(), 4, "extendTtl expects 4 arguments");
-                // SAFETY: We already checked that the length of args is 4 so it is safe to unwrap here
-                let slot_no = match args.first().unwrap() {
-                    Expression::NumberLiteral { value, .. } => value,
-                    _ => panic!(
-                        "Expected slot_no to be of type Expression::NumberLiteral. Actual: {:?}",
-                        args.get(1).unwrap()
-                    ),
-                }
-                .to_u64()
-                .unwrap();
-                let threshold = match args.get(1).unwrap() {
-                    Expression::NumberLiteral { value, .. } => value,
-                    _ => panic!(
-                        "Expected threshold to be of type Expression::NumberLiteral. Actual: {:?}",
-                        args.get(1).unwrap()
-                    ),
-                }
-                .to_u64()
-                .unwrap();
-                let extend_to = match args.get(2).unwrap() {
-                    Expression::NumberLiteral { value, .. } => value,
-                    _ => panic!(
-                        "Expected extend_to to be of type Expression::NumberLiteral. Actual: {:?}",
-                        args.get(2).unwrap()
-                    ),
-                }
-                .to_u64()
-                .unwrap();
-                let storage_type = match args.get(3).unwrap() {
-                    Expression::NumberLiteral { value, .. } => value,
-                    _ => panic!(
-                    "Expected storage_type to be of type Expression::NumberLiteral. Actual: {:?}",
-                    args.get(3).unwrap()
-                ),
-                }
-                .to_u64()
-                .unwrap();
-
-                // Encode the values (threshold and extend_to)
-                // See: https://github.com/stellar/stellar-protocol/blob/master/core/cap-0046-01.md#tag-values
-                let threshold_u32_val = (threshold << 32) + 4;
-                let extend_to_u32_val = (extend_to << 32) + 4;
-
-                // Call the function
-                let function_name = HostFunctions::ExtendContractDataTtl.name();
-                let function_value =
-                    runtime_helper(bin, function_name, "emitting Soroban extendTtl builtin");
-
-                let value = bin
-                    .builder
-                    .build_call(
-                        function_value,
-                        &[
-                            bin.context.i64_type().const_int(slot_no, false).into(),
-                            bin.context.i64_type().const_int(storage_type, false).into(),
-                            bin.context
-                                .i64_type()
-                                .const_int(threshold_u32_val, false)
-                                .into(),
-                            bin.context
-                                .i64_type()
-                                .const_int(extend_to_u32_val, false)
-                                .into(),
-                        ],
-                        function_name,
-                    )
-                    .unwrap()
-                    .try_as_basic_value()
-                    .left()
-                    .unwrap_or_else(|| {
-                        expect_return_value(None, "emitting Soroban extendTtl builtin")
-                    })
-                    .into_int_value();
-
-                value.into()
-            }
-            Expression::Builtin {
-                kind: Builtin::ExtendInstanceTtl,
-                args,
-                ..
-            } => {
-                // Get arguments
-                // (func $extend_contract_data_ttl (param $k_val i64) (param $t_storage_type i64) (param $threshold_u32_val i64) (param $extend_to_u32_val i64) (result i64))
-                assert_eq!(args.len(), 2, "extendTtl expects 2 arguments");
-                // SAFETY: We already checked that the length of args is 2 so it is safe to unwrap here
-                let threshold = match args.first().unwrap() {
-                    Expression::NumberLiteral { value, .. } => value,
-                    _ => panic!(
-                        "Expected threshold to be of type Expression::NumberLiteral. Actual: {:?}",
-                        args.get(1).unwrap()
-                    ),
-                }
-                .to_u64()
-                .unwrap();
-                let extend_to = match args.get(1).unwrap() {
-                    Expression::NumberLiteral { value, .. } => value,
-                    _ => panic!(
-                        "Expected extend_to to be of type Expression::NumberLiteral. Actual: {:?}",
-                        args.get(2).unwrap()
-                    ),
-                }
-                .to_u64()
-                .unwrap();
-
-                // Encode the values (threshold and extend_to)
-                // See: https://github.com/stellar/stellar-protocol/blob/master/core/cap-0046-01.md#tag-values
-                let threshold_u32_val = (threshold << 32) + 4;
-                let extend_to_u32_val = (extend_to << 32) + 4;
-
-                // Call the function
-                let function_name = HostFunctions::ExtendCurrentContractInstanceAndCodeTtl.name();
-                let function_value = runtime_helper(
-                    bin,
-                    function_name,
-                    "emitting Soroban extendInstanceTtl builtin",
-                );
-
-                let value = bin
-                    .builder
-                    .build_call(
-                        function_value,
-                        &[
-                            bin.context
-                                .i64_type()
-                                .const_int(threshold_u32_val, false)
-                                .into(),
-                            bin.context
-                                .i64_type()
-                                .const_int(extend_to_u32_val, false)
-                                .into(),
-                        ],
-                        function_name,
-                    )
-                    .unwrap()
-                    .try_as_basic_value()
-                    .left()
-                    .unwrap_or_else(|| {
-                        expect_return_value(None, "emitting Soroban extendInstanceTtl builtin")
-                    })
-                    .into_int_value();
-
-                value.into()
-            }
-            _ => unsupported_soroban(expr.loc(), "this Soroban builtin"),
-        }
+        unsupported_soroban(expr.loc(), "this Soroban builtin")
     }
 
     /// Return the return data from an external call (either revert error or return values)
@@ -1192,145 +771,6 @@ fn encode_value<'a>(
         .unwrap()
 }
 
-fn load_slot_index_from_key_ptr<'a>(
-    bin: &Binary<'a>,
-    key_ptr: PointerValue<'a>,
-) -> (IntValue<'a>, IntValue<'a>) {
-    let slot_val = bin
-        .builder
-        .build_load(bin.context.i64_type(), key_ptr, "key_slot")
-        .unwrap()
-        .into_int_value(); // slot loaded from key array
-    let index_ptr = unsafe {
-        bin.builder
-            .build_gep(
-                bin.context.i64_type(),
-                key_ptr,
-                &[bin.context.i64_type().const_int(1, false)],
-                "key_index_ptr",
-            )
-            .unwrap()
-    }; // pointer to index element
-    let index_val = bin
-        .builder
-        .build_load(bin.context.i64_type(), index_ptr, "key_index")
-        .unwrap()
-        .into_int_value(); // index loaded from key array
-    (slot_val, index_val)
-}
-
-fn get_storage_vec_subscript<'a>(
-    bin: &Binary<'a>,
-    _function: FunctionValue<'a>,
-    key_vec: IntValue<'a>,
-) -> BasicValueEnum<'a> {
-    let key_ptr = bin
-        .builder
-        .build_int_to_ptr(key_vec, bin.context.ptr_type(Default::default()), "key_ptr")
-        .unwrap(); // pointer to key array
-    let (slot_val, index_val) = load_slot_index_from_key_ptr(bin, key_ptr); // slot/index from key array
-
-    let vec_obj = bin
-        .builder
-        .build_call(
-            bin.module
-                .get_function(HostFunctions::GetContractData.name())
-                .unwrap(),
-            &[
-                slot_val.into(),
-                bin.context.i64_type().const_int(1, false).into(),
-            ],
-            "load_storage",
-        )
-        .unwrap()
-        .try_as_basic_value()
-        .left()
-        .unwrap()
-        .into_int_value(); // vec object from storage
-    let index_val = encode_value(index_val, 32, 4, bin); // index encoded as u32 val
-    let elem_val = bin
-        .builder
-        .build_call(
-            bin.module
-                .get_function(HostFunctions::VecGet.name())
-                .unwrap(),
-            &[vec_obj.into(), index_val.into()],
-            "vec_get",
-        )
-        .unwrap()
-        .try_as_basic_value()
-        .left()
-        .unwrap()
-        .into_int_value(); // element from vec
-    elem_val.as_basic_value_enum()
-}
-
-fn set_storage_vec_subscript<'a>(
-    bin: &Binary<'a>,
-    _function: FunctionValue<'a>,
-    key_vec: IntValue<'a>,
-    value: IntValue<'a>,
-) {
-    let key_ptr = bin
-        .builder
-        .build_int_to_ptr(key_vec, bin.context.ptr_type(Default::default()), "key_ptr")
-        .unwrap(); // pointer to key array
-    let (slot_val, index_val) = load_slot_index_from_key_ptr(bin, key_ptr); // slot/index from key array
-
-    // encode index as u32 val
-    let index_val = encode_value(index_val, 32, 4, bin); // index encoded as u32 val
-
-    let vec_obj = bin
-        .builder
-        .build_call(
-            bin.module
-                .get_function(HostFunctions::GetContractData.name())
-                .unwrap(),
-            &[
-                slot_val.into(),
-                bin.context.i64_type().const_int(1, false).into(),
-            ],
-            "load_storage",
-        )
-        .unwrap()
-        .try_as_basic_value()
-        .left()
-        .unwrap()
-        .into_int_value(); // vec object from storage
-    let new_vec_obj = bin
-        .builder
-        .build_call(
-            bin.module
-                .get_function(HostFunctions::VecPut.name())
-                .unwrap(),
-            &[vec_obj.into(), index_val.into(), value.into()],
-            "vec_put",
-        )
-        .unwrap()
-        .try_as_basic_value()
-        .left()
-        .unwrap()
-        .into_int_value(); // updated vec object
-    let _store_storage = bin
-        .builder
-        .build_call(
-            bin.module
-                .get_function(HostFunctions::PutContractData.name())
-                .unwrap(),
-            &[
-                slot_val.into(),
-                new_vec_obj.into(),
-                bin.context.i64_type().const_int(1, false).into(),
-            ],
-            "store_storage",
-        )
-        .unwrap()
-        .try_as_basic_value()
-        .left()
-        .unwrap()
-        .into_int_value(); // store updated vec
-}
-
 fn is_val_true<'ctx>(bin: &Binary<'ctx>, val: IntValue<'ctx>) -> IntValue<'ctx> {
     let tag_mask = bin.context.i64_type().const_int(0xff, false);
     let tag_true = bin.context.i64_type().const_int(1, false);
@@ -1352,19 +792,21 @@ pub fn type_to_tagged_zero_val<'ctx>(bin: &Binary<'ctx>, ty: &Type) -> IntValue<
 
     // Tag definitions from CAP-0046
     let tag = match ty {
-        Type::Bool => 0,        // Tag::False
-        Type::Uint(32) => 4,    // Tag::U32Val
-        Type::Int(32) => 5,     // Tag::I32Val
-        Type::Enum(_) => 4,     // Tag::U32Val
-        Type::Uint(64) => 6,    // Tag::U64Small
-        Type::Int(64) => 7,     // Tag::I64Small
-        Type::Uint(128) => 10,  // Tag::U128Small
-        Type::Int(128) => 11,   // Tag::I128Small
-        Type::Uint(256) => 12,  // Tag::U256Small
-        Type::Int(256) => 13,   // Tag::I256Small
-        Type::String => 73,     // Tag::StringObject
-        Type::Address(_) => 77, // Tag::AddressObject
-        Type::Void => 2,        // Tag::Void
+        Type::Bool => 0,          // Tag::False
+        Type::Uint(32) => 4,      // Tag::U32Val
+        Type::Int(32) => 5,       // Tag::I32Val
+        Type::Enum(_) => 4,       // Tag::U32Val
+        Type::Uint(64) => 6,      // Tag::U64Small
+        Type::Int(64) => 7,       // Tag::I64Small
+        Type::Uint(128) => 10,    // Tag::U128Small
+        Type::Int(128) => 11,     // Tag::I128Small
+        Type::Uint(256) => 12,    // Tag::U256Small
+        Type::Int(256) => 13,     // Tag::I256Small
+        Type::Bytes(_) => 72,     // Tag::BytesObject
+        Type::String => 73,       // Tag::StringObject
+        Type::DynamicBytes => 72, // Tag::BytesObject
+        Type::Address(_) => 77,   // Tag::AddressObject
+        Type::Void => 2,          // Tag::Void
         _ => {
             // Fallback to Void for unsupported types
             2 // Tag::Void
@@ -1374,219 +816,4 @@ pub fn type_to_tagged_zero_val<'ctx>(bin: &Binary<'ctx>, ty: &Type) -> IntValue<
     // All zero body + tag in lower 8 bits
     let tag_val: u64 = tag;
     i64_type.const_int(tag_val, false)
-}
-
-/// Given a linear-memory buffer of consecutive Soroban Val-encoded i64 fields
-/// [field0, field1, ...], push a field index onto `base_key_vec` and call
-/// PutContractData for each field separately.
-///
-/// - `base_key_vec`: i64 Val for a Soroban Vector key (e.g., [slot, mapping_index])
-/// - `buffer_ptr`: pointer to the first byte of the buffer (i8*)
-/// - `field_count`: number of 64-bit Val entries in the buffer
-/// - `storage_type`: Soroban storage type tag (Temporary/Persistent/Instance)
-pub fn soroban_put_fields_from_val_buffer<'a>(
-    bin: &Binary<'a>,
-    _function: FunctionValue<'a>,
-    base_key_vec: IntValue<'a>,
-    buffer_ptr: PointerValue<'a>,
-    field_count: usize,
-    storage_type: u64,
-) {
-    emit_context!(bin);
-
-    let i64_t = bin.context.i64_type();
-
-    for i in 0..field_count {
-        // Compute pointer to field i: buffer_ptr + i * 8
-        let byte_offset = i64_t.const_int(i as u64, false);
-        let field_byte_ptr = unsafe {
-            bin.builder
-                .build_gep(i64_t, buffer_ptr, &[byte_offset], "field_byte_ptr")
-                .unwrap()
-        };
-
-        // Cast to i64* and load the Val-encoded i64
-        let field_val_i64 = bin
-            .builder
-            .build_load(i64_t, field_byte_ptr, "field_val_i64")
-            .unwrap()
-            .into_int_value();
-
-        // Extend key with field index: push U32Val(i)
-        let idx_u32 = bin.context.i32_type().const_int(i as u64, false);
-        let idx_val = encode_value(idx_u32, 32, 4, bin);
-        let field_key_vec = bin
-            .builder
-            .build_call(
-                bin.module
-                    .get_function(HostFunctions::VecPushBack.name())
-                    .unwrap(),
-                &[base_key_vec.into(), idx_val.into()],
-                "key_push_field",
-            )
-            .unwrap()
-            .try_as_basic_value()
-            .left()
-            .unwrap()
-            .into_int_value();
-
-        // Store this field value under the extended key
-        // storage_type is a plain u64 here
-        let storage_ty_val = bin.context.i64_type().const_int(storage_type, false);
-        let _ = bin
-            .builder
-            .build_call(
-                bin.module
-                    .get_function(HostFunctions::PutContractData.name())
-                    .unwrap(),
-                &[
-                    field_key_vec.into(),
-                    field_val_i64.into(),
-                    storage_ty_val.into(),
-                ],
-                "put_field_from_buffer",
-            )
-            .unwrap();
-    }
-}
-
-/// Fetch each field value from storage using `base_key_vec` extended with the field index,
-/// and write them into a freshly allocated linear buffer as consecutive i64 Soroban Vals.
-/// Returns a pointer to `struct.vector` whose payload size is `field_count * 8` bytes.
-pub fn soroban_get_fields_to_val_buffer<'a>(
-    bin: &Binary<'a>,
-    function: FunctionValue<'a>,
-    base_key_vec: IntValue<'a>,
-    field_count: usize,
-    storage_type: u64,
-) -> PointerValue<'a> {
-    emit_context!(bin);
-
-    // Allocate zero-initialized buffer
-    let size_bytes = bin
-        .context
-        .i32_type()
-        .const_int((field_count as u64) * 8, false);
-
-    let vec_ptr = bin
-        .builder
-        .build_call(
-            runtime_helper(
-                bin,
-                "soroban_malloc",
-                "allocating Soroban storage struct field buffer",
-            ),
-            &[size_bytes.into()],
-            "soroban_malloc",
-        )
-        .unwrap()
-        .try_as_basic_value()
-        .left()
-        .unwrap_or_else(|| {
-            expect_return_value(None, "allocating Soroban storage struct field buffer")
-        })
-        .into_pointer_value();
-
-    let storage_ty_i64 = bin.context.i64_type().const_int(storage_type, false);
-
-    for i in 0..field_count {
-        // key = base_key_vec ++ U32Val(i)
-        let idx_u32 = bin.context.i32_type().const_int(i as u64, false);
-        let idx_val = encode_value(idx_u32, 32, 4, bin);
-        let field_key_vec = bin
-            .builder
-            .build_call(
-                bin.module
-                    .get_function(HostFunctions::VecPushBack.name())
-                    .unwrap(),
-                &[base_key_vec.into(), idx_val.into()],
-                "key_push_field",
-            )
-            .unwrap()
-            .try_as_basic_value()
-            .left()
-            .unwrap()
-            .into_int_value();
-
-        // has = HasContractData(key, storage_type)
-        let has_val = bin
-            .builder
-            .build_call(
-                bin.module
-                    .get_function(HostFunctions::HasContractData.name())
-                    .unwrap(),
-                &[field_key_vec.into(), storage_ty_i64.into()],
-                "has_field",
-            )
-            .unwrap()
-            .try_as_basic_value()
-            .left()
-            .unwrap()
-            .into_int_value();
-        let cond = is_val_true(bin, has_val);
-
-        // Blocks
-        let then_bb = bin.context.append_basic_block(function, "load_field");
-        let else_bb = bin.context.append_basic_block(function, "skip_field");
-        let cont_bb = bin.context.append_basic_block(function, "cont_field");
-
-        bin.builder
-            .build_conditional_branch(cond, then_bb, else_bb)
-            .unwrap();
-
-        // THEN: fetch and store val into buffer[i]
-        bin.builder.position_at_end(then_bb);
-        let val_i64 = bin
-            .builder
-            .build_call(
-                bin.module
-                    .get_function(HostFunctions::GetContractData.name())
-                    .unwrap(),
-                &[field_key_vec.into(), storage_ty_i64.into()],
-                "get_field",
-            )
-            .unwrap()
-            .try_as_basic_value()
-            .left()
-            .unwrap()
-            .into_int_value();
-        let idx64 = bin.context.i64_type().const_int((i) as u64, false);
-        let elem_ptr = unsafe {
-            bin.builder
-                .build_gep(bin.context.i64_type(), vec_ptr, &[idx64], "elem_ptr")
-                .unwrap()
-        };
-        bin.builder.build_store(elem_ptr, val_i64).unwrap();
-        bin.builder.build_unconditional_branch(cont_bb).unwrap();
-
-        // ELSE: leave zero (already zero-initialized)
-        bin.builder.position_at_end(else_bb);
-        bin.builder.build_unconditional_branch(cont_bb).unwrap();
-
-        // CONT
-        bin.builder.position_at_end(cont_bb);
-    }
-
-    //bin.vector_bytes(  vec_ptr.as_basic_value_enum())
-    vec_ptr
-}
-
-fn is_reference_type(ty: &Type) -> bool {
-    match ty {
-        Type::Bool => false,
-        Type::Address(_) => false,
-        Type::Int(_) => false,
-        Type::Uint(_) => false,
-        Type::Rational => false,
-        Type::Bytes(_) => false,
-        Type::Enum(_) => false,
-        Type::Struct(_) => true,
-        Type::Array(..) => true,
-        Type::DynamicBytes => true,
-        Type::String => true,
-        Type::Mapping(..) => true,
-        Type::Contract(_) => false,
-        Type::InternalFunction { .. } => false,
-        _ => false,
-    }
 }

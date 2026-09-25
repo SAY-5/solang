@@ -1,14 +1,13 @@
-// SPDX-License-Identifier: Apache-2.0
-pragma solidity ^0.8.0;
+/// SPDX-License-Identifier: Apache-2.0
 
 contract Pause {
-    bool private instance _isPaused;
+    bool instance paused_flag = false;
 
     function paused() public view returns (bool) {
-        return _isPaused;
+        return paused_flag;
     }
 
-    function set(bool p) public {
-        _isPaused = p;
+    function set(bool paused) public {
+        paused_flag = paused;
     }
 }

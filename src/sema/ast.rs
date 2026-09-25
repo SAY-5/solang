@@ -1839,9 +1839,16 @@ pub enum Builtin {
     TypeRuntimeCode,
     TypeCreatorCode,
     RequireAuth,
+    RequireAuthForArgs,
     AuthAsCurrContract,
+    UpdateCurrentContractWasm,
+    DeployContract,
     ExtendTtl,
     ExtendInstanceTtl,
+    ToXdr,
+    Bls12381G1Add,
+    Bls12381G1Mul,
+    Bls12381MultiPairingCheck,
 }
 
 #[derive(PartialEq, Eq, Clone, Debug)]
